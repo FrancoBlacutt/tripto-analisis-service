@@ -1,19 +1,57 @@
-import io
+"""
+analysis.py - Replica fiel del Colab tripto_analisis_completo.ipynb
+Ejecuta el pipeline de Machine Learning sobre transacciones de Tripto:
+  1) Limpieza y normalizacion de datos
+  2) Construccion RFM por merchant
+  3) Segmentacion KMeans (4 clusters etiquetados: Premium / Alto Valor / Medio / Basico)
+  4) CLV historico y proyectado
+  5) Churn prediction con LogisticRegression vs RandomForest (selecciona mejor por AUC)
+  6) Forecast de monto/utilidad/transacciones con Holt-Winters
+  7) Agregaciones por segmento y por nivel de riesgo
+"""
+import warnings
+warnings.filterwarnings("ignore")
+
 import math
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.metrics import roc_auc_score
+
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
+
+# Parametros del Colab (celda 3)
+K_FINAL = 4
 CHURN_DAYS = 60
 FORECAST_WEEKS = 12
-K_CLUSTERS = 4
+SEG_ORDER = ["Premium", "Alto Valor", "Medio", "Basico"]
+
+FEATURES_SEG = [
+    "recency_days", "num_tx", "monto_total", "utilidad_total",
+    "ticket_avg", "tenure_months", "pct_pos",
+    "clientes_unicos", "paises_unicos",
+]
+
+FEATURES_CHURN = [
+    "recency_days", "recency_ratio", "tenure_months",
+    "num_tx", "tx_per_month",
+    "monto_total", "monto_mensual",
+    "ticket_avg", "margen_real",
+    "pct_pos", "clientes_unicos", "paises_unicos",
+    "trend",
+]
+
+
+# ----- Helpers de parseo (replicas exactas del Colab) -----
 
 def _strip_accents(s):
     if not isinstance(s, str):
@@ -21,177 +59,445 @@ def _strip_accents(s):
     nfkd = unicodedata.normalize("NFKD", s)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
-def _parse_money(x):
-    if pd.isna(x):
+
+def parse_money(s):
+    """Convierte strings monetarios (US o EU) a float. Ej: '$1,234.56' -> 1234.56"""
+    if pd.isna(s):
         return np.nan
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip()
-    if not s:
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s).replace("$", "").replace("\xa0", "").strip()
+    if s in ("", "-", "N/A", "nan"):
         return np.nan
-    s = s.replace("$", "").replace(" ", "").replace("Bs", "").replace("BS", "").replace("bs", "")
-    if "," in s and "." in s:
+    lc, lp = s.rfind(","), s.rfind(".")
+    if lc > lp:
         s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")
     try:
         return float(s)
     except Exception:
         return np.nan
 
-def _normalize_col(c):
+
+def parse_pct(s):
+    """Convierte '1.59%' -> 0.0159"""
+    if pd.isna(s):
+        return np.nan
+    if isinstance(s, (int, float)):
+        return float(s)
+    try:
+        return float(str(s).replace("%", "").replace(",", ".").strip()) / 100
+    except Exception:
+        return np.nan
+
+
+def _norm(c):
     return _strip_accents(str(c)).strip().lower().replace(" ", "_")
 
+
 def _find_col(df, candidates):
-    norm_map = {_normalize_col(c): c for c in df.columns}
+    """Encuentra columna por nombre tolerante a acentos/may/min."""
+    norm_map = {_norm(c): c for c in df.columns}
     for cand in candidates:
-        key = _normalize_col(cand)
+        key = _norm(cand)
         if key in norm_map:
             return norm_map[key]
     return None
 
+
 def _clean_dataframe(df):
-    df = df.copy()
-    col_tenant = _find_col(df, ["Tenant", "tenant", "Tenant ID", "TenantId", "tenant_id"])
-    col_fecha = _find_col(df, ["Fecha", "fecha", "Date", "Fecha Transaccion", "Fecha Pago", "created", "Created"])
-    col_monto = _find_col(df, ["Monto", "monto", "Amount", "Total", "Importe", "Valor"])
-    col_tipo = _find_col(df, ["Tipo", "tipo", "Type", "Tipo Transaccion", "Operacion"])
-    if col_tenant is None or col_fecha is None or col_monto is None:
-        raise ValueError(f"Missing required columns. Found columns: {list(df.columns)}")
-    df = df.rename(columns={col_tenant: "Tenant", col_fecha: "Fecha", col_monto: "Monto"})
-    if col_tipo is not None and col_tipo != "Tipo":
-        df = df.rename(columns={col_tipo: "Tipo"})
-    df["Monto"] = df["Monto"].apply(_parse_money)
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["Tenant", "Fecha", "Monto"])
-    df["Tenant"] = df["Tenant"].astype(str).str.strip()
+    """Replica celdas 5-8 del Colab."""
+    money_cols = [
+        "Monto Bruto", "Neto Recibido", "Comision", "Comision Plataforma Destino",
+        "Utilidad Tripto", "Fee Fijo (de Tenant (ID))", "Fee POS (de Tenant (ID))",
+        "Fee Link (de Tenant (ID))", "Monto depositado", "Ajuste Diff",
+        "Monto Mostrado al Cliente", "Monto Neto total", "Ajuste Neto total",
+    ]
+    for col_label in money_cols:
+        real = _find_col(df, [col_label])
+        if real is not None:
+            df[real] = df[real].apply(parse_money)
+
+    pct_cols = ["Margen tripto", "margen ajustado Tripto", "Fee variable%", "take rate tripto"]
+    for col_label in pct_cols:
+        real = _find_col(df, [col_label])
+        if real is not None:
+            df[real] = df[real].apply(parse_pct)
+
+    # Fecha de Creacion
+    fc = _find_col(df, ["Fecha de Creacion", "Fecha de Creación"])
+    if fc is not None:
+        df[fc] = pd.to_datetime(df[fc], format="%m/%d/%Y %H:%M", errors="coerce")
+        mask_na = df[fc].isna()
+        if mask_na.any():
+            df.loc[mask_na, fc] = pd.to_datetime(df.loc[mask_na, fc], errors="coerce")
     return df
+
 
 def _filter_charges(df):
-    if "Tipo" in df.columns:
-        tipo_norm = df["Tipo"].astype(str).map(lambda s: _strip_accents(s).strip().lower())
-        keep = tipo_norm.isin(["cobro", "pago", "charge", "payment"])
-        if keep.any():
-            df = df[keep].copy()
-    df = df[df["Monto"] > 0].copy()
-    return df
+    """Solo charges reales (sin testMode). Celda 8."""
+    tt = _find_col(df, ["Tipo de Transaccion", "Tipo de Transacción"])
+    if tt is None:
+        return df.copy()
+    charges = df[df[tt].astype(str).str.lower() == "charge"].copy()
+    tm = _find_col(charges, ["testMode (metadata)"])
+    if tm is not None:
+        charges = charges[charges[tm].astype(str).str.lower() != "true"]
+    return charges
 
-def _build_rfm(df, ref_date):
-    g = df.groupby("Tenant").agg(
-        ultima_fecha=("Fecha", "max"),
-        primera_fecha=("Fecha", "min"),
-        frecuencia=("Monto", "count"),
-        monto_total=("Monto", "sum"),
-        monto_promedio=("Monto", "mean"),
+
+def _build_rfm(charges):
+    """Construye tabla RFM por Tenant id. Replica celda 17 del Colab."""
+    fc = _find_col(charges, ["Fecha de Creacion", "Fecha de Creación"])
+    tid = _find_col(charges, ["Tenant id", "Tenant ID"])
+    tname = _find_col(charges, ["Tenant (Nombre)", "Tenant Nombre"])
+    monto = _find_col(charges, ["Monto Bruto"])
+    util = _find_col(charges, ["Utilidad Tripto"])
+    margen = _find_col(charges, ["margen ajustado Tripto"])
+    id_col = _find_col(charges, ["ID"])
+    email = _find_col(charges, ["Email del Cliente"])
+    origen = _find_col(charges, ["Origen"])
+    canal = _find_col(charges, ["payment_channel_f", "Payment Channel"])
+
+    REF_DATE = charges[fc].max()
+
+    agg = charges.groupby(tid).agg(
+        nombre=(tname, lambda x: x.mode().iloc[0] if not x.empty else "Unknown"),
+        ultima_tx=(fc, "max"),
+        primera_tx=(fc, "min"),
+        num_tx=(id_col, "count"),
+        monto_total=(monto, "sum"),
+        utilidad_total=(util, "sum"),
+        margen_avg=(margen, "mean") if margen else (id_col, "count"),
+        ticket_avg=(monto, "mean"),
+        clientes_unicos=(email, "nunique") if email else (id_col, "count"),
+        paises_unicos=(origen, "nunique") if origen else (id_col, "count"),
     ).reset_index()
-    g["recencia_dias"] = (ref_date - g["ultima_fecha"]).dt.days
-    g["antiguedad_dias"] = (ref_date - g["primera_fecha"]).dt.days
-    return g
+    agg = agg.rename(columns={tid: "Tenant id"})
 
-def _kmeans_segmentation(rfm):
-    feats = rfm[["recencia_dias", "frecuencia", "monto_total"]].copy()
-    feats = feats.fillna(feats.median(numeric_only=True))
-    if len(feats) < K_CLUSTERS:
-        rfm = rfm.copy()
-        rfm["cluster"] = 0
-        rfm["segmento"] = "Sin segmentar"
-        return rfm
+    agg["recency_days"] = (REF_DATE - agg["ultima_tx"]).dt.days
+    agg["tenure_days"] = (agg["ultima_tx"] - agg["primera_tx"]).dt.days + 1
+    agg["tenure_months"] = agg["tenure_days"] / 30.44
+    agg["tx_per_month"] = agg["num_tx"] / agg["tenure_months"].clip(lower=0.5)
+    agg["monto_mensual"] = agg["monto_total"] / agg["tenure_months"].clip(lower=0.5)
+    agg["margen_real"] = agg["utilidad_total"] / agg["monto_total"].clip(lower=0.01)
+    agg["recency_ratio"] = agg["recency_days"] / agg["tenure_days"].clip(lower=1)
+
+    # % POS por merchant
+    if canal:
+        canal_mix = charges.groupby([tid, canal])[id_col].count().unstack(fill_value=0)
+        total_ch = canal_mix.sum(axis=1)
+        pos_s = canal_mix["POS"] if "POS" in canal_mix.columns else pd.Series(0, index=total_ch.index)
+        pct_pos = (pos_s / total_ch).rename("pct_pos").reset_index().rename(columns={tid: "Tenant id"})
+        agg = agg.merge(pct_pos, on="Tenant id", how="left")
+    else:
+        agg["pct_pos"] = 0.0
+    agg["pct_pos"] = agg["pct_pos"].fillna(0)
+    return agg, REF_DATE
+
+
+def _segment_kmeans(rfm):
+    """KMeans con K=4 + etiquetado dinamico por monto_total. Celda 20."""
+    X = rfm[FEATURES_SEG].fillna(0).values
     scaler = StandardScaler()
-    X = scaler.fit_transform(feats.values)
-    km = KMeans(n_clusters=K_CLUSTERS, n_init=10, random_state=42)
-    labels = km.fit_predict(X)
-    rfm = rfm.copy()
-    rfm["cluster"] = labels
-    summary = rfm.groupby("cluster").agg(rec=("recencia_dias", "mean"), freq=("frecuencia", "mean"), mon=("monto_total", "mean")).reset_index()
-    summary["score"] = -summary["rec"] + summary["freq"] + summary["mon"]
-    summary = summary.sort_values("score", ascending=False).reset_index(drop=True)
-    names = ["Champions", "Leales", "En riesgo", "Hibernando"]
-    mapping = {int(c): names[i] if i < len(names) else f"Cluster {i}" for i, c in enumerate(summary["cluster"].tolist())}
-    rfm["segmento"] = rfm["cluster"].map(mapping)
+    X_sc = scaler.fit_transform(X)
+    km = KMeans(n_clusters=K_FINAL, random_state=42, n_init=10)
+    rfm["cluster"] = km.fit_predict(X_sc)
+
+    order_map = (
+        rfm.groupby("cluster")["monto_total"].mean()
+        .sort_values(ascending=False)
+        .reset_index()
+        .assign(segmento=SEG_ORDER[:K_FINAL])
+        .set_index("cluster")["segmento"]
+    )
+    rfm["segmento"] = rfm["cluster"].map(order_map)
     return rfm
 
-def _clv(rfm, horizon_days=365):
-    rfm = rfm.copy()
-    rfm["antiguedad_dias"] = rfm["antiguedad_dias"].clip(lower=1)
-    rfm["freq_diaria"] = rfm["frecuencia"] / rfm["antiguedad_dias"]
-    rfm["clv_estimado"] = (rfm["freq_diaria"] * horizon_days * rfm["monto_promedio"]).round(2)
+
+def _compute_clv(rfm):
+    """CLV historico + proyectado. Celda 25."""
+    rfm["clv_historico"] = rfm["utilidad_total"]
+    rfm["activo"] = rfm["recency_days"] <= CHURN_DAYS
+
+    pct_inactivos = (~rfm["activo"]).mean()
+    avg_vida_meses = rfm["tenure_months"].mean()
+    churn_mensual = max(pct_inactivos / max(avg_vida_meses, 1e-6), 0.03)
+    vida_esperada_meses = 1 / churn_mensual
+
+    rfm["util_mensual"] = rfm["utilidad_total"] / rfm["tenure_months"].clip(lower=0.5)
+    rfm["vida_restante"] = (vida_esperada_meses - rfm["tenure_months"]).clip(lower=0)
+    rfm["clv_proyectado"] = rfm["util_mensual"] * rfm["vida_restante"]
+    rfm["clv_total"] = rfm["clv_historico"] + rfm["clv_proyectado"]
     return rfm
 
-def _activity_trend(df):
-    df = df.copy()
-    df["semana"] = df["Fecha"].dt.to_period("W").dt.start_time
-    ts = df.groupby("semana").agg(transacciones=("Monto", "count"), ingresos=("Monto", "sum")).reset_index()
-    ts = ts.sort_values("semana").reset_index(drop=True)
-    return ts
 
-def _forecast(ts, weeks=FORECAST_WEEKS):
-    if len(ts) < 8:
-        return pd.DataFrame(columns=["semana", "ingresos_pred", "transacciones_pred"])
-    last_date = ts["semana"].max()
-    future_index = [last_date + timedelta(weeks=i+1) for i in range(weeks)]
-    out = pd.DataFrame({"semana": future_index})
-    for col in ["ingresos", "transacciones"]:
-        try:
-            model = ExponentialSmoothing(ts[col].astype(float).values, trend="add", seasonal=None, initialization_method="estimated").fit()
-            preds = model.forecast(weeks)
-            out[f"{col}_pred"] = np.round(np.maximum(preds, 0), 2)
-        except Exception:
-            out[f"{col}_pred"] = float(ts[col].mean())
-    return out
+def _compute_trend(charges, rfm):
+    """Tendencia de actividad por merchant. Celda 34."""
+    tid = _find_col(charges, ["Tenant id", "Tenant ID"])
+    fc = _find_col(charges, ["Fecha de Creacion", "Fecha de Creación"])
+    monto = _find_col(charges, ["Monto Bruto"])
 
-def _churn_model(rfm, ref_date):
-    rfm = rfm.copy()
-    rfm["churned"] = (rfm["recencia_dias"] > CHURN_DAYS).astype(int)
-    features = ["recencia_dias", "frecuencia", "monto_total", "monto_promedio", "antiguedad_dias"]
-    X = rfm[features].fillna(0).values
+    trends = {}
+    for t, g in charges.groupby(tid):
+        g = g.sort_values(fc)
+        if len(g) < 4:
+            trends[t] = 0.0
+            continue
+        mid = len(g) // 2
+        a1 = g.iloc[:mid][monto].mean()
+        a2 = g.iloc[mid:][monto].mean()
+        if a1 == 0 or pd.isna(a1) or pd.isna(a2):
+            trends[t] = 0.0
+        else:
+            trends[t] = (a2 - a1) / a1
+    rfm["trend"] = rfm["Tenant id"].map(trends).fillna(0.0)
+    return rfm
+
+
+def _predict_churn(rfm):
+    """LR vs RF con CV; elige mejor por AUC. Celdas 35-36."""
+    rfm["churned"] = (rfm["recency_days"] > CHURN_DAYS).astype(int)
+    X = rfm[FEATURES_CHURN].fillna(0).values
     y = rfm["churned"].values
-    if len(np.unique(y)) < 2 or len(rfm) < 10:
-        rfm["prob_churn"] = rfm["churned"].astype(float)
+
+    # Si hay una sola clase no se puede entrenar; fallback
+    if len(np.unique(y)) < 2 or len(y) < 10:
+        rfm["churn_prob"] = y.astype(float)
+        rfm["churn_pred"] = y
+        rfm["best_model"] = "fallback"
     else:
         scaler = StandardScaler()
-        Xs = scaler.fit_transform(X)
-        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-        clf.fit(Xs, y)
-        rfm["prob_churn"] = np.round(clf.predict_proba(Xs)[:, 1], 4)
-    def _bucket(p):
-        if p >= 0.7:
-            return "Alto"
-        if p >= 0.4:
-            return "Medio"
-        return "Bajo"
-    rfm["nivel_riesgo"] = rfm["prob_churn"].apply(_bucket)
+        X_sc = scaler.fit_transform(X)
+        n_splits = min(5, int(y.sum()), int((1 - y).sum()))
+        n_splits = max(2, n_splits)
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        lr = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42)
+        lr_proba = cross_val_predict(lr, X_sc, y, cv=cv, method="predict_proba")[:, 1]
+        lr_auc = roc_auc_score(y, lr_proba)
+
+        rf = RandomForestClassifier(n_estimators=300, class_weight="balanced",
+                                    max_depth=4, random_state=42)
+        rf_proba = cross_val_predict(rf, X_sc, y, cv=cv, method="predict_proba")[:, 1]
+        rf_auc = roc_auc_score(y, rf_proba)
+
+        if rf_auc >= lr_auc:
+            best_proba, best_name = rf_proba, "RandomForest"
+        else:
+            best_proba, best_name = lr_proba, "LogisticRegression"
+
+        rfm["churn_prob"] = best_proba
+        rfm["churn_pred"] = (best_proba >= 0.5).astype(int)
+        rfm["best_model"] = best_name
+
+    rfm["riesgo"] = pd.cut(
+        rfm["churn_prob"],
+        bins=[-0.001, 0.35, 0.65, 1.001],
+        labels=["Bajo Riesgo", "Medio Riesgo", "Alto Riesgo"],
+    )
     return rfm
 
-def _build_outputs(rfm, forecast):
-    seg = rfm[["Tenant", "segmento", "recencia_dias", "frecuencia", "monto_total", "monto_promedio", "clv_estimado"]].copy()
-    seg.columns = ["Tenant", "Segmento", "Recencia (dias)", "Frecuencia", "Monto Total", "Monto Promedio", "CLV Estimado"]
-    risk = rfm[["Tenant", "nivel_riesgo", "prob_churn", "recencia_dias", "frecuencia", "monto_total"]].copy()
-    risk.columns = ["Tenant", "Nivel Riesgo", "Probabilidad Churn", "Recencia (dias)", "Frecuencia", "Monto Total"]
-    fc = forecast.copy()
-    if not fc.empty:
-        fc["semana"] = pd.to_datetime(fc["semana"]).dt.strftime("%Y-%m-%d")
-    fc_cols_map = {"semana": "Semana", "ingresos_pred": "Ingresos Pronostico", "transacciones_pred": "Transacciones Pronostico"}
-    fc = fc.rename(columns={k: v for k, v in fc_cols_map.items() if k in fc.columns})
-    return seg, risk, fc
 
-def run_full_analysis(df_raw):
-    df = _clean_dataframe(df_raw)
-    df = _filter_charges(df)
-    if df.empty:
-        raise ValueError("No valid transactions after cleaning")
-    ref_date = df["Fecha"].max() + pd.Timedelta(days=1)
-    rfm = _build_rfm(df, ref_date)
-    rfm = _kmeans_segmentation(rfm)
-    rfm = _clv(rfm)
-    rfm = _churn_model(rfm, ref_date)
-    ts = _activity_trend(df)
-    fc = _forecast(ts, FORECAST_WEEKS)
-    seg, risk, fc_out = _build_outputs(rfm, fc)
+def _aggregate_segments(rfm):
+    """Perfil de Segmentos. Celda 20 (parte final)."""
+    seg = rfm.groupby("segmento").agg(
+        merchants=("Tenant id", "count"),
+        recency_avg=("recency_days", "mean"),
+        tx_avg=("num_tx", "mean"),
+        monto_avg=("monto_total", "mean"),
+        utilidad_avg=("utilidad_total", "mean"),
+        ticket_avg=("ticket_avg", "mean"),
+        tenure_avg=("tenure_months", "mean"),
+        margen_avg=("margen_real", "mean"),
+        pct_pos_avg=("pct_pos", "mean"),
+        clientes_avg=("clientes_unicos", "mean"),
+    ).reindex(SEG_ORDER).round(2).reset_index()
+    return seg
+
+
+def _aggregate_risk(rfm):
+    """Resumen por Nivel Riesgo. Celda 38."""
+    risk = rfm.groupby("riesgo", observed=True).agg(
+        merchants=("Tenant id", "count"),
+        utilidad_en_riesgo=("utilidad_total", "sum"),
+        churn_prob_avg=("churn_prob", "mean"),
+    ).reset_index()
+    risk["riesgo"] = risk["riesgo"].astype(str)
+    return risk
+
+
+def _forecast(charges):
+    """Holt-Winters sobre series semanales. Celdas 40-41."""
+    fc = _find_col(charges, ["Fecha de Creacion", "Fecha de Creación"])
+    monto = _find_col(charges, ["Monto Bruto"])
+    util = _find_col(charges, ["Utilidad Tripto"])
+    id_col = _find_col(charges, ["ID"])
+
+    charges = charges.copy()
+    charges["week"] = charges[fc].dt.to_period("W")
+    weekly = charges.groupby("week").agg(
+        monto_bruto=(monto, "sum"),
+        utilidad=(util, "sum"),
+        n_tx=(id_col, "count"),
+    ).reset_index()
+    weekly["week_dt"] = weekly["week"].dt.to_timestamp()
+    weekly = weekly.sort_values("week_dt").reset_index(drop=True)
+    if len(weekly) > 1:
+        weekly = weekly.iloc[1:].reset_index(drop=True)
+
+    if len(weekly) < 4:
+        return []
+
+    last_date = weekly["week_dt"].max()
+    future_dates = pd.date_range(
+        start=last_date + pd.Timedelta(weeks=1),
+        periods=FORECAST_WEEKS, freq="W-MON",
+    )
+
+    def fc_series(series):
+        try:
+            model = ExponentialSmoothing(
+                series, trend="add", seasonal=None,
+                initialization_method="estimated",
+            ).fit(optimized=True)
+            vals = np.array(model.forecast(FORECAST_WEEKS))
+            residuals = series - model.fittedvalues
+            rmse = float(np.sqrt((residuals ** 2).mean()))
+            return vals, rmse
+        except Exception:
+            return np.array([float(np.mean(series))] * FORECAST_WEEKS), float(np.std(series))
+
+    mb_vals, mb_rmse = fc_series(weekly["monto_bruto"].values)
+    ut_vals, _ = fc_series(weekly["utilidad"].values)
+    tx_vals, _ = fc_series(weekly["n_tx"].values.astype(float))
+
+    # Agregacion mensual
+    fc_df = pd.DataFrame({
+        "fecha": future_dates,
+        "monto_forecast": mb_vals,
+        "ci95_lo": mb_vals - 1.96 * mb_rmse,
+        "ci95_hi": mb_vals + 1.96 * mb_rmse,
+        "utilidad_forecast": ut_vals,
+        "tx_forecast": tx_vals,
+    })
+    fc_df["mes"] = fc_df["fecha"].dt.to_period("M").astype(str)
+    monthly = fc_df.groupby("mes").agg(
+        monto_forecast=("monto_forecast", "sum"),
+        ci95_lo=("ci95_lo", "sum"),
+        ci95_hi=("ci95_hi", "sum"),
+        utilidad_forecast=("utilidad_forecast", "sum"),
+        tx_forecast=("tx_forecast", "sum"),
+    ).reset_index().round(2)
+    return monthly.to_dict(orient="records")
+
+
+def _format_merchants(rfm, fecha_analisis):
+    """Genera el array Merchants_Completo con nombres en espanol. Celda 46."""
+    cols_in = [
+        "Tenant id", "nombre", "segmento", "activo", "riesgo",
+        "recency_days", "num_tx", "monto_total", "utilidad_total",
+        "margen_real", "ticket_avg", "tenure_months", "pct_pos",
+        "clientes_unicos", "paises_unicos", "trend",
+        "tx_per_month", "monto_mensual",
+        "clv_historico", "util_mensual", "clv_proyectado", "clv_total",
+        "churn_prob", "churn_pred",
+    ]
+    out = rfm[cols_in].sort_values("clv_total", ascending=False).copy()
+    out.columns = [
+        "Tenant ID", "Nombre", "Segmento", "Activo", "Riesgo Churn",
+        "Recencia (dias)", "N Transacciones", "Monto Bruto Total", "Utilidad Tripto Total",
+        "Margen %", "Ticket Promedio", "Antiguedad (meses)", "% POS",
+        "Clientes Unicos", "Paises Origen", "Tendencia Actividad",
+        "Tx / Mes", "Monto Mensual",
+        "CLV Historico", "Utilidad Mensual", "CLV Proyectado", "CLV Total",
+        "P(Churn)", "Prediccion Churn",
+    ]
+    out["Activo"] = out["Activo"].astype(bool)
+    out["Prediccion Churn"] = out["Prediccion Churn"].astype(bool)
+    out["Riesgo Churn"] = out["Riesgo Churn"].astype(str)
+    out["Tendencia Actividad"] = out["Tendencia Actividad"].apply(
+        lambda x: f"{x:+.1%}" if pd.notna(x) else ""
+    )
+    out["Fecha Analisis"] = fecha_analisis
+
+    # Redondeos coherentes con el Excel
+    for c in ["Monto Bruto Total", "Utilidad Tripto Total", "Ticket Promedio",
+              "Monto Mensual", "Utilidad Mensual", "CLV Historico",
+              "CLV Proyectado", "CLV Total"]:
+        out[c] = out[c].astype(float).round(2)
+    for c in ["Margen %", "% POS", "P(Churn)"]:
+        out[c] = out[c].astype(float).round(4)
+    return out.to_dict(orient="records")
+
+
+def _format_segments(seg_df, fecha_analisis):
+    out = seg_df.copy()
+    out.columns = [
+        "Segmento", "N Merchants", "Recencia Promedio (dias)",
+        "Tx Promedio", "Monto Promedio", "Utilidad Promedio",
+        "Ticket Promedio", "Antiguedad Promedio (meses)",
+        "Margen Promedio", "% POS Promedio", "Clientes Promedio",
+    ]
+    out["Fecha Analisis"] = fecha_analisis
+    return out.to_dict(orient="records")
+
+
+def _format_risk(risk_df, fecha_analisis):
+    out = risk_df.copy()
+    out.columns = ["Nivel Riesgo", "N Merchants", "Utilidad en Riesgo", "P(Churn) Promedio"]
+    out["Utilidad en Riesgo"] = out["Utilidad en Riesgo"].astype(float).round(2)
+    out["P(Churn) Promedio"] = out["P(Churn) Promedio"].astype(float).round(4)
+    out["Fecha Analisis"] = fecha_analisis
+    return out.to_dict(orient="records")
+
+
+def _format_tenants(rfm, fecha_analisis):
+    """Array compacto para upsert en Tenants Airtable."""
+    out = rfm[["Tenant id", "segmento", "riesgo", "churn_prob"]].copy()
+    out.columns = ["Tenant ID", "Segmento", "Nivel Riesgo", "P(Churn)"]
+    out["Nivel Riesgo"] = out["Nivel Riesgo"].astype(str)
+    out["P(Churn)"] = out["P(Churn)"].astype(float).round(4)
+    out["Fecha Analisis"] = fecha_analisis
+    return out.to_dict(orient="records")
+
+
+def run_full_analysis(df):
+    """Pipeline completo. Recibe DataFrame de transacciones crudas, devuelve dict con 5 arrays."""
+    fecha_analisis = datetime.now(timezone.utc).isoformat()
+
+    df = _clean_dataframe(df)
+    charges = _filter_charges(df)
+    if charges.empty:
+        return {
+            "fecha_analisis": fecha_analisis,
+            "n_transacciones": 0,
+            "n_tenants": 0,
+            "merchants_completo": [],
+            "perfil_segmentos": [],
+            "resumen_riesgo_churn": [],
+            "forecast_mensual": [],
+            "tenants_resultados": [],
+        }
+
+    rfm, _ = _build_rfm(charges)
+    rfm = _segment_kmeans(rfm)
+    rfm = _compute_clv(rfm)
+    rfm = _compute_trend(charges, rfm)
+    rfm = _predict_churn(rfm)
+
+    seg_df = _aggregate_segments(rfm)
+    risk_df = _aggregate_risk(rfm)
+    forecast = _forecast(charges)
+
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "n_tenants": int(rfm["Tenant"].nunique()),
-        "n_transacciones": int(len(df)),
-        "segmentacion": seg.to_dict(orient="records"),
-        "riesgo_churn": risk.to_dict(orient="records"),
-        "forecast": fc_out.to_dict(orient="records"),
+        "fecha_analisis": fecha_analisis,
+        "n_transacciones": int(len(charges)),
+        "n_tenants": int(len(rfm)),
+        "merchants_completo": _format_merchants(rfm, fecha_analisis),
+        "perfil_segmentos": _format_segments(seg_df, fecha_analisis),
+        "resumen_riesgo_churn": _format_risk(risk_df, fecha_analisis),
+        "forecast_mensual": forecast,
+        "tenants_resultados": _format_tenants(rfm, fecha_analisis),
     }
