@@ -91,7 +91,7 @@ def _body_to_dataframe(body) -> pd.DataFrame:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "tripto-analisis-ml", "version": "3.0.0"}
+    return {"status": "ok", "service": "tripto-analisis-ml", "version": "3.0.1"}
 
 
 @app.get("/")
@@ -146,6 +146,9 @@ async def analyze(
     try:
         result = run_full_analysis(df)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error en analisis: {str(e)}")
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[/analyze ERROR] {type(e).__name__}: {e}\n{tb}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Error en analisis: {type(e).__name__}: {str(e)}")
 
     return JSONResponse(content=_clean_json(result))
