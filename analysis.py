@@ -652,6 +652,7 @@ def run_full_analysis(df):
     rfm, churn_m = _compute_clv(rfm)
 
     # 6. Churn prediction
+    rfm["churned"] = (rfm["recency_days"] > CHURN_DAYS).astype(int)
     if rfm["churned"].sum() >= 2 and (~rfm["churned"].astype(bool)).sum() >= 2:
         rfm, best_auc = _predict_churn(rfm)
     else:
